@@ -1,0 +1,889 @@
+#Load packages and get all our play by play data from last 10 years. 
+library(nflfastR)
+library(dplyr)
+library(xgboost)
+library(caret)
+library(ggplot2)
+library(tidyr)
+library(readr)
+
+# Load play-by-play data for 2015-2025
+pbp <- load_pbp(2015:2025)
+
+#Filter out all the data for what we need for offensive plays
+offense_plays <- pbp %>%
+  filter(season_type == "REG",
+         play_type %in% c("run", "pass"),
+         !qb_spike,
+         !qb_kneel) %>%
+  group_by(game_id, drive) %>%
+  arrange(game_id, drive, play_id) %>%
+  mutate(
+    next_yardline_100 = dplyr::lead(yardline_100),
+    yards_manual = yardline_100 - next_yardline_100
+  ) %>%
+  ungroup() %>%
+  filter(!is.na(yards_manual)) %>%
+  select(
+    season, game_id, posteam, defteam, down, ydstogo, yardline_100,
+    qtr, half_seconds_remaining, score_differential, desc,
+    play_type, run_location, pass_location, pass_length,
+    shotgun, no_huddle, qb_scramble, goal_to_go,
+    yards_manual
+  )
+
+cat("Total plays loaded:", nrow(pbp), "\n")
+cat("Seasons:", unique(pbp$season), "\n")
+cat("Play types:", table(pbp$play_type), "\n")
+cat("Offensive plays retained:", nrow(offense_plays), "\n")
+cat("Percentage of original data:", round(100 * nrow(offense_plays)/nrow(pbp), 1), "%\n")
+
+
+#Prepare the dataset for modeling. 
+set.seed(42)
+
+df <- offense_plays %>%
+  mutate(
+    play_type = factor(play_type),
+    pass_length = factor(pass_length, levels = c("short","deep")),
+    run_location = factor(run_location),
+    qtr = factor(qtr),
+    shotgun = as.integer(shotgun),
+    no_huddle = as.integer(no_huddle),
+    qb_scramble = as.integer(qb_scramble),
+    goal_to_go = as.integer(goal_to_go)
+  ) %>%
+  filter(!is.na(down), !is.na(ydstogo), !is.na(yardline_100),
+         !is.na(qtr), !is.na(score_differential), !is.na(yards_manual))
+
+#Train and test split. 
+train_idx <- caret::createDataPartition(df$yards_manual, p = 0.8, list = FALSE)
+train <- df[train_idx, ]
+test  <- df[-train_idx, ]
+
+# Fit logistic model for pass/run tendency
+pass_glm <- glm(I(play_type == "pass") ~ down + ydstogo + yardline_100 + qtr +
+                  half_seconds_remaining + score_differential,
+                data = train, family = binomial())
+
+# Features formula for XGBoost
+formula_feats <- ~ down + ydstogo + yardline_100 + qtr +
+  half_seconds_remaining + score_differential +
+  play_type + goal_to_go
+
+#Prepare the xgboost matrices and train the data. 
+X_train <- model.matrix(formula_feats, data = train)[, -1]
+X_test  <- model.matrix(formula_feats, data = test)[, -1]
+
+y_train <- train$yards_manual
+y_test  <- test$yards_manual
+
+dtrain <- xgb.DMatrix(data = X_train, label = y_train)
+dtest  <- xgb.DMatrix(data = X_test, label = y_test)
+
+params <- list(
+  objective = "reg:squarederror",
+  eta = 0.1,
+  max_depth = 6,
+  subsample = 0.7,
+  colsample_bytree = 0.7
+)
+
+xgb_model <- xgb.train(params = params,
+                       data = dtrain,
+                       nrounds = 200,
+                       watchlist = list(train = dtrain),
+                       verbose = 0)
+
+#Evaluate our model
+pred_test <- predict(xgb_model, dtest)
+rmse_test <- sqrt(mean((pred_test - y_test)^2))
+
+cat("\n=== MODEL PERFORMANCE ===\n")
+cat("Test RMSE:", round(rmse_test, 3), "yards\n")
+cat("Test MAE:", round(mean(abs(pred_test - y_test)), 3), "yards\n")
+cat("Test R²:", round(cor(pred_test, y_test)^2, 3), "\n")
+
+importance_matrix <- xgb.importance(model = xgb_model)
+print(importance_matrix[1:10,])
+
+cat("\nPredicted yards - Summary:\n")
+print(summary(pred_test))
+cat("\nActual yards - Summary:\n")
+print(summary(y_test))
+
+#Helper function to predict yards.
+predict_yards <- function(state_row) {
+  mm <- model.matrix(formula_feats, data = state_row)[, -1, drop = FALSE]
+  missing_cols <- setdiff(colnames(X_train), colnames(mm))
+  if(length(missing_cols) > 0) {
+    add_mat <- matrix(0, nrow = nrow(mm), ncol = length(missing_cols))
+    colnames(add_mat) <- missing_cols
+    mm <- cbind(mm, add_mat)
+  }
+  mm <- mm[, colnames(X_train), drop = FALSE]
+  pred <- predict(xgb_model, newdata = mm)
+  return(as.numeric(pred))
+}
+
+#Gather our data for field goals, punts, and 4th down conversions. 
+fg_data <- pbp %>%
+  filter(play_type == "field_goal", !is.na(kick_distance),
+         field_goal_result %in% c("made", "missed")) %>%
+  mutate(fg_made = ifelse(field_goal_result == "made", 1, 0)) %>%
+  select(kick_distance, fg_made)
+
+go4it_data <- pbp %>%
+  filter(down == 4, play_type %in% c("run", "pass"),
+         !qb_spike, !qb_kneel) %>%
+  arrange(game_id, drive, play_id) %>%
+  group_by(game_id, drive) %>%
+  mutate(next_yardline_100 = lead(yardline_100),
+         yards_manual = yardline_100 - next_yardline_100) %>%
+  ungroup() %>%
+  filter(!is.na(yards_manual), !is.na(ydstogo)) %>%
+  mutate(converted = as.integer(yards_manual >= ydstogo)) %>%
+  select(yards_manual, ydstogo, yardline_100, qtr, score_differential, converted)
+
+# Get average punts from data
+punt_data <- pbp %>%
+  filter(play_type == "punt", !is.na(yards_gained)) %>%
+  mutate(punt_distance = yards_gained) %>%
+  select(punt_distance)
+
+
+#Write our models and functions to predict outcomes of attempts and kicks. 
+fg_model <- glm(fg_made ~ kick_distance, data = fg_data, family = binomial())
+go4it_model <- glm(converted ~ ydstogo + yardline_100 + qtr + score_differential,
+                   data = go4it_data, family = binomial())
+
+predict_fg_success <- function(fg_distance) {
+  newdata <- data.frame(kick_distance = fg_distance)
+  predict(fg_model, newdata = newdata, type = "response")
+}
+
+predict_go4it_success <- function(yardline_100, ydstogo, qtr = 2, score_differential = 0) {
+  newdata <- data.frame(
+    ydstogo = ydstogo,
+    yardline_100 = yardline_100,
+    qtr = qtr,
+    score_differential = score_differential
+  )
+  predict(go4it_model, newdata = newdata, type = "response")
+}
+
+#Calculate our expected points for each outcome, then decide. 
+# Create a proper Expected Points table based on field position
+# This is based on historical NFL data
+get_ep_by_field_position <- function(yardline_100) {
+  # yardline_100 is yards from opponent's endzone
+  # These values are approximations from NFL analytics
+  ep_table <- data.frame(
+    yardline = c(99, 95, 90, 85, 80, 75, 70, 65, 60, 55, 50, 45, 40, 35, 30, 25, 20, 15, 10, 5, 1),
+    ep = c(-1.25, -0.75, -0.50, 0.00, 0.40, 0.70, 1.00, 1.30, 1.55, 1.75, 2.00, 2.20, 2.40, 2.65, 2.90, 3.25, 3.65, 4.10, 4.60, 5.50, 6.00)
+  )
+  
+  # Linear interpolation for yardlines not in the table
+  approx(ep_table$yardline, ep_table$ep, xout = yardline_100, rule = 2)$y
+}
+
+# Updated EPA calculation for going for it with conversion odds and expected yards
+expected_points_go4it <- function(yardline_100, ydstogo, qtr = 2, score_differential = 0) {
+  # Probability of converting (gaining enough yards for first down)
+  p_convert <- predict_go4it_success(yardline_100, ydstogo, qtr, score_differential)
+  
+  # Create a state for predicting yards on 4th down attempt
+  state_row <- data.frame(
+    down = 4,
+    ydstogo = ydstogo,
+    yardline_100 = yardline_100,
+    qtr = factor(qtr, levels = levels(train$qtr)),
+    half_seconds_remaining = 900,  # neutral
+    score_differential = score_differential,
+    play_type = factor("pass", levels = c("run", "pass")),  # assume pass on 4th
+    goal_to_go = as.integer(yardline_100 <= 10)
+  )
+  
+  # Predict expected yards gained on the attempt
+  expected_yards <- predict_yards(state_row)
+  
+  # Scenario 1: Conversion (gain >= ydstogo)
+  # New field position after converting
+  new_yardline_convert <- max(1, yardline_100 - ydstogo)
+  ep_convert <- get_ep_by_field_position(new_yardline_convert)
+  
+  # Scenario 2: Partial gain but no conversion (0 < gain < ydstogo)
+  # Opponent gets ball where we ended up
+  yards_gained_fail <- max(0, min(expected_yards, ydstogo - 0.5))  # likely partial yards
+  fail_yardline <- yardline_100 - yards_gained_fail
+  opp_yardline_partial <- 100 - fail_yardline
+  ep_partial_fail <- -get_ep_by_field_position(opp_yardline_partial)
+  
+  # Scenario 3: Complete failure (negative or zero yards, sack, etc.)
+  # Opponent gets ball at original spot
+  opp_yardline_no_gain <- 100 - yardline_100
+  ep_total_fail <- -get_ep_by_field_position(opp_yardline_no_gain)
+  
+  # Weight the scenarios
+  # If we convert: use conversion probability
+  # If we don't convert: split between partial gain and total failure
+  p_partial_fail <- (1 - p_convert) * 0.7  # 70% of failures are partial gains
+  p_total_fail <- (1 - p_convert) * 0.3     # 30% of failures are no gain/negative
+  
+  # Calculate weighted EPA
+  ep_go4it <- (p_convert * ep_convert) + 
+    (p_partial_fail * ep_partial_fail) + 
+    (p_total_fail * ep_total_fail)
+  
+  # Penalize aggressive 4th down attempts based on yards to go
+  penalty <- if (ydstogo > 5) {
+    # scale penalty linearly beyond 5 yards, up to -3.0 EPA
+    min(0.5 * (ydstogo - 5))
+  } else {
+    0
+  }
+  
+  #add a weighting to simulate conservative coaching
+  return(ep_go4it - penalty - 1.5)
+}
+
+expected_points_fg <- function(yardline_100) {
+  fg_dist <- 117 - (100 - yardline_100)
+  if (fg_dist > 70) {
+    return(-Inf) # Disallow long FG
+  }
+  p_fg <- predict_fg_success(fg_dist)
+  ep_make <- 3  # Made FG
+  
+  # If miss: opponent gets ball at spot of kick (roughly)
+  # Missed FGs from <30 yards: ball at spot of kick
+  # Missed FGs from 30+ yards: ball at original line of scrimmage
+  if (fg_dist < 38) {
+    # Short miss - they get it at the spot
+    miss_yardline <- min(80, 100 - yardline_100)
+  } else {
+    # Long miss - they get it at line of scrimmage
+    miss_yardline <- 100 - yardline_100
+  }
+  ep_miss <- -get_ep_by_field_position(miss_yardline)
+  
+  return(p_fg * ep_make + (1 - p_fg) * ep_miss)
+}
+
+# Updated punt EPA with more realistic punt modeling
+expected_points_punt <- function(yardline_100) {
+  #if comfortably in fg range do not consider punting
+  if (yardline_100 <= 38) {
+    return(-Inf) # Disallow long FG
+  }
+  # Use average punt distance
+  avg_punt <- mean(punt_data$punt_distance, na.rm = TRUE)
+  
+  # Adjust punt distance based on field position
+  # Punts from deep in your territory go farther
+  # Punts near opponent endzone are shorter (coffin corner attempts)
+  if (yardline_100 > 60) {
+    # Deep in own territory - longer punts
+    punt_distance <- avg_punt * 1.1
+  } else if (yardline_100 < 35) {
+    # Near opponent endzone - shorter, more careful punts
+    punt_distance <- avg_punt * 0.7
+  } else {
+    punt_distance <- avg_punt
+  }
+  
+  # Calculate where opponent gets the ball
+  gross_yardline <- yardline_100 + punt_distance
+  
+  # Account for touchbacks (ball placed at 20)
+  if (gross_yardline >= 100) {
+    opp_yardline <- 20
+  } else {
+    # Account for punt returns (average ~8 yards)
+    avg_return <- 8
+    net_punt <- punt_distance - avg_return
+    opp_yardline <- max(100 - (yardline_100 + net_punt), 5)  # minimum at their 5
+  }
+  
+  # Our EP = negative of opponent's EP, add a weighting to simulate conservative coaching
+  return(-get_ep_by_field_position(opp_yardline) + 2.5)
+}
+
+#Now our function to make the decision based on ep. 
+should_go_for_it <- function(yardline_100, ydstogo) {
+  ep_go4it <- expected_points_go4it(yardline_100, ydstogo)
+  ep_fg    <- expected_points_fg(yardline_100)
+  ep_punt  <- expected_points_punt(yardline_100)
+  
+  decisions <- c("GO FOR IT", "FIELD GOAL", "PUNT")
+  best <- which.max(c(ep_go4it, ep_fg, ep_punt))
+  
+  cat(sprintf("\n4th Down Decision (%d yards to go, %.0f yards from endzone): %s\n",
+              ydstogo, yardline_100, decisions[best]))
+  cat(sprintf("Expected Points → Go: %.2f | FG: %.2f | Punt: %.2f\n",
+              ep_go4it, ep_fg, ep_punt))
+  
+  list(
+    decision = decisions[best],
+    ep_go = ep_go4it,
+    ep_fg = ep_fg,
+    ep_punt = ep_punt
+  )
+}
+
+#Code for root mean square error and noise. 
+model_rmse <- rmse_test
+add_noise <- function(pred, rmse = model_rmse) {
+  as.numeric(rnorm(1, mean = pred, sd = rmse))
+}
+
+#Get rates of turnovers and sacks
+fumble_rate <- mean(pbp$fumble == 1, na.rm = TRUE)
+interception_rate <- mean(pbp$interception == 1, na.rm = TRUE)
+sack_rate <- mean(pbp$sack == 1, na.rm = TRUE)
+
+#Simulate one play. 
+simulate_play <- function(state, use_noise = TRUE, verbose = FALSE) {
+  if(!is.null(state$force_play_type)) {
+    chosen_play <- state$force_play_type
+    # Decide whether to pass or run based on logistic regression model
+  } else {
+    pg_df <- data.frame(
+      down = as.numeric(state$down),
+      ydstogo = as.numeric(state$ydstogo),
+      yardline_100 = as.numeric(state$yardline_100),
+      qtr = factor(state$qtr, levels = levels(train$qtr)),
+      half_seconds_remaining = as.numeric(state$half_seconds_remaining),
+      score_differential = as.numeric(state$score_differential)
+    )
+    pass_prob <- predict(pass_glm, newdata = pg_df, type = "response")
+    chosen_play <- ifelse(runif(1) < pass_prob, "pass", "run")
+  }
+  
+  # Predict yards gained using XGBoost model
+  state_row <- data.frame(
+    down = as.numeric(state$down),
+    ydstogo = as.numeric(state$ydstogo),
+    yardline_100 = as.numeric(state$yardline_100),
+    qtr = factor(state$qtr, levels = levels(train$qtr)),
+    half_seconds_remaining = as.numeric(state$half_seconds_remaining),
+    score_differential = as.numeric(state$score_differential),
+    play_type = factor(chosen_play, levels = c("run", "pass")),
+    goal_to_go = as.integer(state$goal_to_go)
+  )
+  
+  pred_y <- predict_yards(state_row)
+  pred_with_noise <- if(use_noise) add_noise(pred_y) else pred_y
+  yards_manual <- round(pred_with_noise, 0)
+  
+  # Random turnovers or sacks
+  is_fumble <- runif(1) < fumble_rate
+  is_interception <- (!is_fumble && chosen_play == "pass") && (runif(1) < interception_rate)
+  is_sack <- (!is_fumble && !is_interception && chosen_play == "pass") && (runif(1) < sack_rate)
+  
+  #update yardline
+  new_yardline <- max(0, state$yardline_100 - yards_manual)
+  is_td <- (new_yardline == 0)
+  
+  #Update time
+  time_used <- ifelse(chosen_play == "run", 40, 8)
+  new_seconds <- max(0, state$half_seconds_remaining - time_used)
+  
+  # Update down/distance
+  if (!is_td) {
+    yards_to_marker <- state$ydstogo - yards_manual
+    if (yards_manual >= state$ydstogo) {
+      new_down <- 1
+      new_ydstogo <- min(10, new_yardline)
+    } else {
+      new_down <- state$down + 1
+      new_ydstogo <- ifelse(new_down <= 4, max(1, state$ydstogo - yards_manual), NA)
+    }
+  } else {
+    new_down <- 1
+    new_ydstogo <- 10
+  }
+  
+  # --- NEW: Simulate turnovers and sacks ---
+  turnover <- FALSE
+  turnover_type <- NA
+  sack <- FALSE
+  
+  # Probabilities (adjust as needed)
+  prob_fumble <- (mean(pbp$fumble == 1, na.rm = TRUE) / 2)
+  prob_interception <- mean(pbp$interception == 1, na.rm = TRUE)
+  prob_sack <- mean(pbp$sack == 1, na.rm = TRUE)
+  
+  if(runif(1) < prob_fumble) {
+    turnover <- TRUE
+    turnover_type <- "FUMBLE"
+  } else if(runif(1) < prob_interception) {
+    turnover <- TRUE
+    turnover_type <- "INTERCEPTION"
+  } else if(runif(1) < prob_sack) {
+    sack <- TRUE
+    # sack: lose some yards
+    sack_yards <- sample(2:10, 1)
+    new_yardline <- min(100, new_yardline + sack_yards)
+    # down/distance stays the same
+  }
+  
+  # Build play result
+  play_result <- list(
+    yards_manual = yards_manual,
+    play_type = chosen_play,
+    is_td = is_td,
+    event = if (is_td) "TOUCHDOWN" else if (turnover) turnover_type else if(sack) "SACK" else "PLAY",
+    turnover = turnover,
+    turnover_type = turnover_type,
+    sack = sack
+  )
+  
+  #build next state
+  new_state <- list(
+    down = new_down,
+    ydstogo = new_ydstogo,
+    yardline_100 = new_yardline,
+    qtr = state$qtr,
+    half_seconds_remaining = new_seconds,
+    score_differential = state$score_differential,
+    goal_to_go = as.integer(new_yardline <= 10)
+  )
+  
+  if (verbose) {
+    cat("Play:", chosen_play,
+        "| Yds:", yards_manual,
+        "| New yardline:", new_yardline,
+        "| Down:", new_down, "ToGo:", new_ydstogo,
+        "| Time left(s):", new_seconds,
+        if(sack) "| SACK!",
+        if(turnover) paste0("| ", turnover_type, "!"),
+        "\n")
+  }
+  
+  list(state = new_state, result = play_result)
+}
+
+#Make our decisions on 4th down. 
+simulate_fourth_down <- function(state, verbose = TRUE) {
+  yardline_100 <- state$yardline_100
+  ydstogo <- state$ydstogo
+  
+  ep_go4it <- expected_points_go4it(yardline_100, ydstogo)
+  ep_fg    <- expected_points_fg(yardline_100)
+  ep_punt  <- expected_points_punt(yardline_100)
+  
+  decisions <- c("GO FOR IT", "FIELD GOAL", "PUNT")
+  best <- which.max(c(ep_go4it, ep_fg, ep_punt))
+  best_decision <- decisions[best]
+  
+  if (verbose) {
+    cat(sprintf("\n4th Down Decision — %.0f yards from endzone, %d yards to go:\n",
+                yardline_100, ydstogo))
+    cat(sprintf("  Go for it:  %.2f EP\n", ep_go4it))
+    cat(sprintf("  Field goal: %.2f EP\n", ep_fg))
+    cat(sprintf("  Punt:       %.2f EP\n", ep_punt))
+    cat(sprintf("  → Optimal Decision: %s\n", best_decision))
+  }
+  
+  return(list(
+    decision = best_decision,
+    ep_go = ep_go4it,
+    ep_fg = ep_fg,
+    ep_punt = ep_punt
+  ))
+}
+
+#Example simulate 4th down. 
+# Example starting state
+state <- list(
+  down = 4,
+  ydstogo = 3,
+  yardline_100 = 45,  # 45 yards from end zone
+  qtr = 2,
+  half_seconds_remaining = 900,
+  score_differential = 0,
+  goal_to_go = 0
+)
+
+simulate_fourth_down(state)
+
+#Example simulate play. 
+state <- list(
+  down = 1,
+  ydstogo = 10,
+  yardline_100 = 75,
+  qtr = 2,
+  half_seconds_remaining = 900,
+  score_differential = 0,
+  goal_to_go = 0
+)
+
+simulate_play(state, use_noise = TRUE, verbose = TRUE)
+
+#Simulate an entire drive. 
+simulate_drive <- function(
+    start_state,
+    use_noise = TRUE,
+    verbose = TRUE,
+    max_plays = 20
+) {
+  state <- start_state
+  drive_summary <- list()
+  play_count <- 0
+  drive_score <- 0
+  drive_outcome <- NA  # track final result
+  
+  while (TRUE) {
+    play_count <- play_count + 1
+    if (play_count > max_plays) {
+      if (verbose) cat("Drive ended: maximum plays reached.\n")
+      drive_outcome <- "MAX_PLAYS"
+      break
+    }
+    
+    # Check if it's 4th down
+    if (state$down == 4) {
+      fd_decision <- simulate_fourth_down(state, verbose = verbose)
+      decision <- fd_decision$decision
+      
+      # ALWAYS print EPA for 4th down decisions
+      cat(sprintf("\n=== 4TH DOWN at own %d-yard line (%d yards to go) ===\n",
+                  100 - state$yardline_100, state$ydstogo))
+      cat(sprintf("  EPA if GO FOR IT:   %.3f\n", fd_decision$ep_go))
+      cat(sprintf("  EPA if FIELD GOAL:  %.3f\n", fd_decision$ep_fg))
+      cat(sprintf("  EPA if PUNT:        %.3f\n", fd_decision$ep_punt))
+      cat(sprintf("  → DECISION: %s\n", decision))
+      
+      if (decision == "GO FOR IT") {
+        play_res <- simulate_play(state, use_noise = use_noise, verbose = verbose)
+        state <- play_res$state
+        drive_summary[[play_count]] <- list(
+          play_type = "4th_DOWN_GO",
+          yards = play_res$result$yards_manual,
+          new_state = state,
+          is_td = play_res$result$is_td
+        )
+        if (play_res$result$is_td) {
+          drive_score <- 7
+          drive_outcome <- "TOUCHDOWN"
+          if (verbose) cat("Touchdown! Drive ends.\n")
+          break
+        }
+        if (play_res$result$turnover) {
+          drive_outcome <- play_res$result$turnover_type
+          if (verbose) cat(play_res$result$turnover_type, "— Drive ends!\n")
+          break  # Drive ends on fumble or interception
+        }
+        # Check for turnover on downs
+        if (state$down == 5) {
+          drive_outcome <- "TURNOVER_ON_DOWNS"
+          if (verbose) cat("Turnover on downs! Drive ends.\n")
+          break
+        }
+      } else if (decision == "FIELD GOAL") {
+        # Calculate FG distance and success probability
+        fg_dist <- 117 - (100 - state$yardline_100)
+        p_fg <- predict_fg_success(fg_dist)
+        fg_made <- runif(1) < p_fg
+        
+        if (fg_made) {
+          drive_score <- 3
+          drive_outcome <- "FIELD_GOAL_MADE"
+          if (verbose) cat(sprintf("Field goal MADE from %d yards! Drive ends. +3 points.\n", fg_dist))
+        } else {
+          drive_score <- 0
+          drive_outcome <- "FIELD_GOAL_MISSED"
+          if (verbose) cat(sprintf("Field goal MISSED from %d yards! Drive ends.\n", fg_dist))
+        }
+        
+        drive_summary[[play_count]] <- list(
+          play_type = "FIELD_GOAL",
+          yards = NA,
+          new_state = state,
+          is_td = FALSE,
+          fg_made = fg_made,
+          fg_distance = fg_dist
+        )
+        break
+      } else if (decision == "PUNT") {
+        drive_outcome <- "PUNT"
+        if (verbose) cat("Punt. Drive ends.\n")
+        drive_summary[[play_count]] <- list(
+          play_type = "PUNT",
+          yards = NA,
+          new_state = state,
+          is_td = FALSE
+        )
+        break
+      }
+    } else {
+      # Simulate normal play for downs 1-3
+      play_res <- simulate_play(state, use_noise = use_noise, verbose = verbose)
+      state <- play_res$state
+      drive_summary[[play_count]] <- list(
+        play_type = play_res$result$play_type,
+        yards = play_res$result$yards_manual,
+        new_state = state,
+        is_td = play_res$result$is_td
+      )
+      if (play_res$result$is_td) {
+        drive_score <- 7
+        drive_outcome <- "TOUCHDOWN"
+        if (verbose) cat("Touchdown! Drive ends.\n")
+        break
+      }
+      if (play_res$result$turnover) {
+        drive_outcome <- play_res$result$turnover_type
+        if (verbose) cat(play_res$result$turnover_type, "— Drive ends!\n")
+        break  # Drive ends on fumble or interception
+      }
+    }
+    
+    # Stop if half ends
+    if (state$half_seconds_remaining <= 0) {
+      drive_outcome <- "END_OF_HALF"
+      if (verbose) cat("End of half reached. Drive ends.\n")
+      break
+    }
+    
+    # Stop if drive reaches endzone
+    if (state$yardline_100 == 0) {
+      drive_outcome <- "TOUCHDOWN"
+      drive_score <- 7
+      if (verbose) cat("Endzone reached! Touchdown. Drive ends.\n")
+      break
+    }
+  }
+  
+  return(list(
+    final_state = state,
+    score = drive_score, 
+    plays = drive_summary,
+    total_plays = play_count,
+    outcome = drive_outcome
+  ))
+}
+
+#Example simulating a drive. 
+# Starting drive state
+drive_start <- list(
+  down = 1,
+  ydstogo = 10,
+  yardline_100 = 75,
+  qtr = 2,
+  half_seconds_remaining = 900,
+  score_differential = 0,
+  goal_to_go = 0
+)
+
+sim_results <- replicate(10, simulate_drive(drive_start, verbose = FALSE), simplify = FALSE)
+outcomes <- sapply(sim_results, function(x) x$outcome)
+table(outcomes)
+
+#Simulate a lot of drives. 
+simulate_multiple_drives <- function(
+    start_state,
+    n_drives = 1000,
+    use_noise = TRUE,
+    verbose = FALSE
+) {
+  results <- data.frame(
+    drive = integer(),
+    score = numeric(),
+    outcome = character(),
+    total_plays = integer(),
+    stringsAsFactors = FALSE
+  )
+  
+  all_plays <- vector("list", n_drives)  # store play-level info
+  
+  for (i in 1:n_drives) {
+    drive_res <- simulate_drive(start_state, use_noise = use_noise, verbose = verbose)
+    
+    results <- rbind(results, data.frame(
+      drive = i,
+      score = drive_res$score,
+      outcome = drive_res$outcome,
+      total_plays = drive_res$total_plays,
+      stringsAsFactors = FALSE
+    ))
+    
+    all_plays[[i]] <- drive_res$plays
+  }
+  
+  results$plays <- all_plays  # add plays list column
+  
+  # Aggregate summary
+  summary <- results %>%
+    group_by(outcome) %>%
+    summarise(
+      count = n(),
+      avg_score = mean(score),
+      avg_plays = mean(total_plays),
+      .groups = 'drop'
+    )
+  
+  return(list(
+    all_results = results,
+    summary = summary
+  ))
+}
+
+#Sim 1000 drives. 
+#See what happens when we sim 1000 drives. 
+start_state <- list(
+  down = 1,
+  ydstogo = 1000,
+  yardline_100 = 75,
+  qtr = 2,
+  half_seconds_remaining = 900,
+  score_differential = 0,
+  goal_to_go = 0
+)
+
+set.seed(42)
+sim_res <- simulate_multiple_drives(start_state, n_drives = 1000, use_noise = TRUE, verbose = FALSE)
+
+# Check summary
+print(sim_res$summary)
+
+# Optional: view first few drive results
+head(sim_res$all_results)
+
+#add visualizations to our result
+
+#visualize simulated drive outcomes
+# Frequency of each outcome
+sim_res$all_results %>%
+  count(outcome) %>%
+  ggplot(aes(x = reorder(outcome, n), y = n, fill = outcome)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  labs(
+    title = "Simulated Drive Outcomes (1000 Drives)",
+    x = "Outcome",
+    y = "Count"
+  ) +
+  theme_minimal()
+
+#visualize total plays per drive
+sim_res$all_results %>%
+  ggplot(aes(x = total_plays, fill = outcome)) +
+  geom_histogram(binwidth = 1, position = "stack") +
+  labs(
+    title = "Number of Plays per Drive by Outcome",
+    x = "Plays in Drive",
+    y = "Count"
+  ) +
+  theme_minimal()
+
+#compare sim outcomes to historical NFL data
+# Example: read CSV if you exported from sports-reference.com
+# Replace with actual path
+# Create Drive Outcomes table
+drive_outcomes <- data.frame(
+  outcome = c("Punt", "Touchdown", "Field Goal", "Interception", "Downs",
+              "Fumble", "End of Game", "End of Half", "Missed FG", "Safety",
+              "Blocked Punt", "Blocked FG", "Fumble, Safety", "Blocked FG, Downs",
+              "Blocked Punt, Downs", "Blocked Punt, Safety", "All Turnovers", "All Scores"),
+  total = c(23137, 13467, 9136, 4401, 2946, 2657, 2289, 1939, 1586, 135,
+            97, 85, 22, 13, 12, 1, 7058, 22603),
+  pct = c(37.4, 21.7, 14.8, 7.1, 4.8, 4.3, 3.7, 3.1, 2.6, 0.2,
+          0.2, 0.1, 0.0, 0.0, 0.0, 0.0, 11.4, 36.5)
+)
+head(drive_outcomes)
+
+# Write to CSV
+write.csv(drive_outcomes, "/Users/ajayshenoy/Documents/stat479/Drive_Outcomes_Historical.csv", row.names = FALSE)
+
+# Create Play Types table
+play_types <- data.frame(
+  play = c("Pass", "Rush"),
+  total = c(203999, 148017),
+  pct = c(56.1, 40.7),
+  per_drive = c(3.3, 2.4)
+)
+head(play_types)
+
+# Write to CSV
+write.csv(play_types, "/Users/ajayshenoy/Documents/stat479/Play_Types_Historical.csv", row.names = FALSE)
+
+# Load historical drive outcomes
+historical_drives <- read_csv("/Users/ajayshenoy/Documents/stat479/Drive_Outcomes_Historical.csv")
+
+# Summarize simulated outcomes
+sim_summary <- sim_res$all_results %>%
+  group_by(outcome) %>%
+  summarise(count = n()) %>%
+  mutate(prop = count / sum(count))
+
+# Historical proportions
+hist_summary <- historical_drives %>%
+  mutate(prop = total / sum(total)) %>%
+  select(outcome, prop)
+
+# Combine for plotting
+comparison <- bind_rows(
+  sim_summary %>% mutate(source = "Simulated"),
+  hist_summary %>% mutate(source = "Historical")
+)
+
+# Bar chart comparison
+ggplot(comparison, aes(x = reorder(outcome, -prop), y = prop, fill = source)) +
+  geom_col(position = "dodge") +
+  labs(
+    title = "Drive Outcomes: Simulated vs Historical NFL (2015-2025)",
+    x = "Outcome",
+    y = "Proportion"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+#compare passes and rushes
+# Summarize simulated play types
+sim_plays <- sim_res$all_results %>%
+  unnest_longer(plays) %>%      # flatten the list column
+  unnest_wider(plays) %>%       # turn play-level info into columns
+  filter(!is.na(play_type)) %>%
+  group_by(play_type) %>%
+  summarise(count = n()) %>%
+  mutate(prop = count / sum(count))
+
+#bar chart for histogram of plays per drive
+# Number of plays per drive by outcome
+sim_res$all_results %>%
+  ggplot(aes(x = total_plays, fill = outcome)) +
+  geom_histogram(binwidth = 1, position = "stack") +
+  labs(
+    title = "Number of Plays per Drive (Simulated)",
+    x = "Number of Plays",
+    y = "Count"
+  ) +
+  theme_minimal()
+
+
+#visualize epa along parts of the field
+yardline_seq <- 1:100
+ep_go <- sapply(yardline_seq, expected_points_go4it, ydstogo = 4)
+ep_fg <- sapply(yardline_seq, expected_points_fg)
+ep_punt <- sapply(yardline_seq, expected_points_punt)
+
+ep_df <- data.frame(
+  yardline = yardline_seq,
+  GoForIt = ep_go,
+  FG = ep_fg,
+  Punt = ep_punt
+) %>%
+  pivot_longer(cols = c("GoForIt","FG","Punt"), names_to = "Decision", values_to = "EP")
+
+ggplot(ep_df, aes(x = yardline, y = EP, color = Decision)) +
+  geom_line(size = 1.2) +
+  labs(
+    title = "Expected Points by Field Position",
+    x = "Yards from Opponent Endzone",
+    y = "Expected Points"
+  ) +
+  theme_minimal()
+
+
