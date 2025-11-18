@@ -1,6 +1,1 @@
-This code builds a full NFL drive simulation engine using ten seasons of nflfastR play-by-play data (2015–2025). 
-It begins by loading, cleaning, and filtering offensive plays, manually computing yards gained and preparing modeling features. 
-A logistic regression model predicts run vs. pass tendencies, while an XGBoost regression model predicts yards gained for any play state. 
-Additional models estimate field-goal success, fourth-down conversion probability, and typical punt outcomes using historical data.
-With these components, the script constructs an Expected Points (EP) framework for go-for-it decisions and implements play-level simulations that include noise, sacks, turnovers, and clock management.
-Building on this, it simulates entire drives, dynamically choosing between passing, running, punting, field-goal attempts, and fourth-down aggressiveness, producing realistic drive results such as touchdowns, field goals, turnovers, punts, or end-of-half scenarios.
+This code sets up the R environment for an NFL analytics workflow by loading key packages for data retrieval (nflfastR), data wrangling (dplyr, tidyr), machine learning (xgboost, caret), and visualization (ggplot2). It then pulls a full decade of play-by-play data (2015–2025) using load_pbp(), giving you a detailed, event-level dataset for every NFL game in that span. This structure prepares the workspace for tasks like feature engineering, model training, and performance evaluation, building the foundation for more advanced predictive modeling or decision-analysis work.
