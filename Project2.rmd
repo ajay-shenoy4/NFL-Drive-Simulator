@@ -1,3 +1,15 @@
+---
+title: "NFL Fourth Down Simulator & Yardage Model"
+author: "Ajay Shenoy"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+Load packages and data
+```{r}
 #Load packages and get all our play by play data from last 10 years. 
 library(nflfastR)
 library(dplyr)
@@ -9,6 +21,10 @@ library(readr)
 
 # Load play-by-play data for 2015-2025
 pbp <- load_pbp(2015:2025)
+```
+
+Filter out data. 
+```{r}
 
 #Filter out all the data for what we need for offensive plays
 offense_plays <- pbp %>%
@@ -55,6 +71,10 @@ df <- offense_plays %>%
   ) %>%
   filter(!is.na(down), !is.na(ydstogo), !is.na(yardline_100),
          !is.na(qtr), !is.na(score_differential), !is.na(yards_manual))
+```
+
+Train, test, and evaluate our model. 
+```{r}
 
 #Train and test split. 
 train_idx <- caret::createDataPartition(df$yards_manual, p = 0.8, list = FALSE)
@@ -111,6 +131,10 @@ cat("\nPredicted yards - Summary:\n")
 print(summary(pred_test))
 cat("\nActual yards - Summary:\n")
 print(summary(y_test))
+```
+
+Helper function to predict yards/
+```{r}
 
 #Helper function to predict yards.
 predict_yards <- function(state_row) {
@@ -125,6 +149,10 @@ predict_yards <- function(state_row) {
   pred <- predict(xgb_model, newdata = mm)
   return(as.numeric(pred))
 }
+```
+
+Fourth down decision making, get expected points of each to make decision. 
+```{r}
 
 #Gather our data for field goals, punts, and 4th down conversions. 
 fg_data <- pbp %>%
@@ -330,6 +358,10 @@ should_go_for_it <- function(yardline_100, ydstogo) {
     ep_punt = ep_punt
   )
 }
+```
+
+Add noise and turnovers.
+```{r}
 
 #Code for root mean square error and noise. 
 model_rmse <- rmse_test
@@ -341,6 +373,10 @@ add_noise <- function(pred, rmse = model_rmse) {
 fumble_rate <- mean(pbp$fumble == 1, na.rm = TRUE)
 interception_rate <- mean(pbp$interception == 1, na.rm = TRUE)
 sack_rate <- mean(pbp$sack == 1, na.rm = TRUE)
+```
+
+Sim one play.
+```{r}
 
 #Simulate one play. 
 simulate_play <- function(state, use_noise = TRUE, verbose = FALSE) {
@@ -464,6 +500,24 @@ simulate_play <- function(state, use_noise = TRUE, verbose = FALSE) {
   list(state = new_state, result = play_result)
 }
 
+
+#Example simulate play. 
+state <- list(
+  down = 1,
+  ydstogo = 10,
+  yardline_100 = 75,
+  qtr = 2,
+  half_seconds_remaining = 900,
+  score_differential = 0,
+  goal_to_go = 0
+)
+
+simulate_play(state, use_noise = TRUE, verbose = TRUE)
+```
+
+Make 4th down decisions. 
+```{r}
+
 #Make our decisions on 4th down. 
 simulate_fourth_down <- function(state, verbose = TRUE) {
   yardline_100 <- state$yardline_100
@@ -507,19 +561,10 @@ state <- list(
 )
 
 simulate_fourth_down(state)
+```
 
-#Example simulate play. 
-state <- list(
-  down = 1,
-  ydstogo = 10,
-  yardline_100 = 75,
-  qtr = 2,
-  half_seconds_remaining = 900,
-  score_differential = 0,
-  goal_to_go = 0
-)
-
-simulate_play(state, use_noise = TRUE, verbose = TRUE)
+Simulate a drive. 
+```{r}
 
 #Simulate an entire drive. 
 simulate_drive <- function(
@@ -680,6 +725,10 @@ drive_start <- list(
 sim_results <- replicate(10, simulate_drive(drive_start, verbose = FALSE), simplify = FALSE)
 outcomes <- sapply(sim_results, function(x) x$outcome)
 table(outcomes)
+```
+
+Simulate many drives. 
+```{r}
 
 #Simulate a lot of drives. 
 simulate_multiple_drives <- function(
@@ -750,6 +799,10 @@ print(sim_res$summary)
 
 # Optional: view first few drive results
 head(sim_res$all_results)
+```
+
+Visualize our results. 
+```{r}
 
 #add visualizations to our result
 
@@ -885,5 +938,4 @@ ggplot(ep_df, aes(x = yardline, y = EP, color = Decision)) +
     y = "Expected Points"
   ) +
   theme_minimal()
-
-
+```
