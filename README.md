@@ -2,7 +2,6 @@
 
 ![NFL Analytics](https://img.shields.io/badge/Data-nflfastR-blue)
 ![Model](https://img.shields.io/badge/Model-XGBoost-orange)
-![Status](https://img.shields.io/badge/Research-Ongoing-orange)
 ![R](https://img.shields.io/badge/Maintained%20in-R-red)
 
 ## Project Overview
